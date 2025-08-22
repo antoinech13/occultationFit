@@ -1,0 +1,32 @@
+Copyright (c) 2025 Antoine Choukroun
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to use,
+copy, and modify the Software, subject to the following conditions:
+
+1. Attribution Requirement  
+   Any use of this Software, in whole or in part, must include clear attribution
+   by citing the repository URL and the name of the tool in any code, derivative
+   works, documentation, or research where this Software is used.
+
+   Example of citation:
+   "occultationFit, available at https://github.com/antoinech13/occultationFit"
+
+2. Contributions  
+   Contributions to improve the Software are welcome. Any pull requests or
+   submitted patches will be incorporated under the same license terms.
+
+3. Redistribution  
+   Redistribution, with or without modification, is allowed provided that:
+   - The repository URL and the original name of the tool are clearly cited.
+   - The Software is not redistributed under a different name without explicit
+     written permission from the original author(s).
+
+4. Warranty Disclaimer  
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+   THE SOFTWARE.
