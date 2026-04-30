@@ -372,6 +372,13 @@ class ModelParser:
         return [i for i in li if i != ""]
         
     def __parse(self):
+        ext = os.path.splitext(self.path)[1].lower()
+        if ext == '.obj':
+            self.__parseObj()
+        else:
+            self.__parseTri()
+
+    def __parseTri(self):
        with open(self.path, 'r') as file:
            content = file.read()
        
@@ -411,6 +418,33 @@ class ModelParser:
            i += 1
        
        self.triangles = np.array(self.triangles)
+       self.compute_principal_moments()
+
+    def __parseObj(self):
+       vertices = []
+       triangles = []
+       with open(self.path, 'r') as file:
+           for line in file:
+               parts = self.__removeEmptyStrFromList(line.strip().split())
+               if not parts:
+                   continue
+               if parts[0] == 'v':
+                   vertices.append([float(parts[1]), float(parts[2]), float(parts[3])])
+               elif parts[0] == 'f':
+                   p1 = int(parts[1]) - 1
+                   p2 = int(parts[2]) - 1
+                   p3 = int(parts[3]) - 1
+                   triangles.append([p1, p2, p3])
+
+       self.vertices = np.array(vertices)
+       self.nVertices = len(vertices)
+       self.nTriangles = len(triangles)
+
+       norms = np.linalg.norm(self.vertices, axis=1)
+       max_norm = max(norms) if max(norms) != 0 else 1.0
+       self.vertices = self.vertices / max_norm
+
+       self.triangles = np.array(triangles)
        self.compute_principal_moments()
     
     def angOfRot(self, time_of_interest):
@@ -4001,6 +4035,7 @@ def argument():
                                                                                          obtain the same result than the drawshape.m script which is not all time the best way (mirror effect, axis inversed, etc...). This parameter will organise eigenvectors
                                                                                          to ensure that main axis are all positif and in the diagonal of the eigenvectors matrix""")
                                                         
+    parser.add_argument("-ang", "--angle", type = float, default = None, help = "If use with -m: apply a rotation of the given angle (in degrees) along the spin axis before plotting. The rotation applies on transformed vertices if -pI is set.")
     parser.add_argument("-backEnd", "--backEnd", type = str, default = "qt", help = "change graphic back end for matplotlib. if any error are trigger you can change this parameter options are agg, tkagg, qt. DEFAULT: qt")
     
     args = parser.parse_args()                                                                               
@@ -4017,14 +4052,17 @@ def modelTool(args):
     modelPath = args.modelPath
     
 
-    if "*.tri" in modelPath:
+    if "*.tri" in modelPath or "*.obj" in modelPath:
         modelPath = [modelPath]
     else:
-        modelPath = glob.glob(modelPath + "*.tri")
+        modelPath = glob.glob(modelPath + "*.tri") + glob.glob(modelPath + "*.obj")
     
     for file in modelPath:
         print("model of file: ", file)
         mp = ModelParser(file)
+        
+        if not isNone(args.angle):
+            mp.rotate_along_spin(args.angle, args.projectAlongInertia)
         
         if shouldPlotMod:
             mp.plot_vertices(block = True)
@@ -4053,18 +4091,18 @@ def fitOc(args):
             return p
         
         elif os.path.isdir(p):
-            p = glob.glob(p + "*"+ str(solution) + ".tri")
+            candidates = glob.glob(p + "*" + str(solution) + ".tri") + glob.glob(p + "*" + str(solution) + ".obj")
             
-            if len(p) == 0:
-                print("Warning: no model *.tri was found for solution", solution)
+            if len(candidates) == 0:
+                print("Warning: no model *.tri or *.obj was found for solution", solution)
                 return None
             
-            p = p[0]
+            p = candidates[0]
             
-            print("WARNING ! no model.tri was provide," , p, "was found and will be use as solution", solution)
+            print("WARNING ! no model path was provided," , p, "was found and will be use as solution", solution)
         
         else:
-            print("ERROR: no model *.tri was found for solution", solution)
+            print("ERROR: no model *.tri or *.obj was found for solution", solution)
             sys.exit()
             
         return p
