@@ -516,6 +516,250 @@ class ModelParser:
         vert = self.zRmat(lamb) @ vert
         
         return vert.T
+
+    def _build_ecliptic_rotation(self, projectionDate, lamb, beta, period, initialTime, initialPhi):
+        lamb = np.deg2rad(float(lamb))
+        beta = np.deg2rad(float(beta))
+        phi0 = np.deg2rad(float(initialPhi))
+
+        dt_hours = (float(projectionDate) - float(initialTime)) * 24.0
+        n_period = dt_hours / float(period)
+        phi = phi0 + (2.0 * np.pi * n_period)
+
+        return self.zRmat(lamb) @ self.yRmat(np.pi / 2.0 - beta) @ self.zRmat(phi)
+
+    def project_vertices_for_date(self, projectionDate, lamb, beta, period, initialTime, initialPhi, transformed = False):
+        vertices_to_project = self.vertices_transformed if transformed else self.vertices
+        rotation = self._build_ecliptic_rotation(projectionDate, lamb, beta, period, initialTime, initialPhi)
+        projected_vertices = (rotation @ vertices_to_project.T).T
+        spin_axis = rotation @ np.asarray([0.0, 0.0, 1.0])
+
+        return projected_vertices, spin_axis
+
+    def _ecliptic_to_equatorial(self, vectors, projectionDate):
+        t = Time(float(projectionDate), format='jd')
+        julian_centuries = (t.jd - 2451545.0) / 36525.0
+        epsilon = np.deg2rad(23.439292 - 0.0130042 * julian_centuries)
+
+        r_x = np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, np.cos(epsilon), -np.sin(epsilon)],
+            [0.0, np.sin(epsilon), np.cos(epsilon)]
+        ])
+
+        return vectors @ r_x.T
+
+    def _to_occultation_view_frame(self, vectors_equatorial, occ):
+        line_of_sight = -np.cross(occ.sEps, occ.sNu)
+        line_of_sight = line_of_sight / np.linalg.norm(line_of_sight)
+        basis = np.vstack((occ.sNu, occ.sEps, line_of_sight))
+        return vectors_equatorial @ basis.T, line_of_sight
+
+    def _compute_triangle_normals_outward(self, vertices):
+        tris = self.triangles
+        tri_vertices = vertices[tris]
+
+        edge1 = tri_vertices[:, 1] - tri_vertices[:, 0]
+        edge2 = tri_vertices[:, 2] - tri_vertices[:, 0]
+        normals = np.cross(edge2, edge1)
+
+        norm = np.linalg.norm(normals, axis=1)
+        valid = norm > 0
+        normals[valid] = normals[valid] / norm[valid][:, np.newaxis]
+
+        tri_centers = np.mean(tri_vertices, axis=1)
+        model_center = np.mean(vertices, axis=0)
+        outward_sign = np.einsum('ij,ij->i', normals, tri_centers - model_center)
+        flip = outward_sign < 0
+        normals[flip] *= -1.0
+
+        return normals, tri_vertices, tri_centers
+
+    def _ray_intersects_triangle(self, ray_origin, ray_dir, tri_vertices, t_min=1e-6, eps=1e-12):
+        v0 = tri_vertices[0]
+        v1 = tri_vertices[1]
+        v2 = tri_vertices[2]
+
+        e1 = v1 - v0
+        e2 = v2 - v0
+        pvec = np.cross(ray_dir, e2)
+        det = np.dot(e1, pvec)
+
+        if -eps < det < eps:
+            return False
+
+        inv_det = 1.0 / det
+        tvec = ray_origin - v0
+        u = np.dot(tvec, pvec) * inv_det
+        if u < 0.0 or u > 1.0:
+            return False
+
+        qvec = np.cross(tvec, e1)
+        v = np.dot(ray_dir, qvec) * inv_det
+        if v < 0.0 or u + v > 1.0:
+            return False
+
+        t = np.dot(e2, qvec) * inv_det
+        return t > t_min
+
+    def _compute_solar_visibility_factor(self, tri_vertices, tri_centers, sun_dir, incidence):
+        bary_samples = [
+            (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0),
+            (0.6, 0.2, 0.2),
+            (0.2, 0.6, 0.2),
+            (0.2, 0.2, 0.6),
+            (0.5, 0.5, 0.0),
+            (0.5, 0.0, 0.5),
+            (0.0, 0.5, 0.5),
+        ]
+
+        n_tri = tri_vertices.shape[0]
+        visibility = np.zeros((n_tri,), dtype=float)
+
+        lit_indices = np.where(incidence > 0)[0]
+        if len(lit_indices) == 0:
+            return visibility
+
+        sun_dir = sun_dir / np.linalg.norm(sun_dir)
+        origin_offset = 1e-5
+
+        for idx in lit_indices:
+            v0, v1, v2 = tri_vertices[idx]
+
+            visible_count = 0
+            for a, b, c in bary_samples:
+                sample = a * v0 + b * v1 + c * v2
+                ray_origin = sample + sun_dir * origin_offset
+
+                is_occluded = False
+                for j in range(n_tri):
+                    if j == idx:
+                        continue
+
+                    if np.dot(tri_centers[j] - ray_origin, sun_dir) <= 0:
+                        continue
+
+                    if self._ray_intersects_triangle(ray_origin, sun_dir, tri_vertices[j]):
+                        is_occluded = True
+                        break
+
+                if not is_occluded:
+                    visible_count += 1
+
+            visibility[idx] = visible_count / float(len(bary_samples))
+
+        return visibility
+
+    def plot_projected_from_earth(self, projectionDate, lamb, beta, period, initialTime, initialPhi, transformed = False, block = False, title = "", occ = None, textureSun = False, sun_vector_eq = None):
+        vertices_ecl, spin_axis_ecl = self.project_vertices_for_date(
+            projectionDate,
+            lamb,
+            beta,
+            period,
+            initialTime,
+            initialPhi,
+            transformed
+        )
+
+        vertices_eq = self._ecliptic_to_equatorial(vertices_ecl, projectionDate)
+        spin_axis_eq = self._ecliptic_to_equatorial(np.asarray([spin_axis_ecl]), projectionDate)[0]
+
+        if not isNone(occ):
+            vertices_to_plot, line_of_sight = self._to_occultation_view_frame(vertices_eq, occ)
+            spin_axis = self._to_occultation_view_frame(np.asarray([spin_axis_eq]), occ)[0][0]
+            spin_axis_eq = spin_axis_eq / np.linalg.norm(spin_axis_eq)
+            aspect_angle = np.degrees(np.arccos(np.clip(np.dot(spin_axis_eq, line_of_sight), -1.0, 1.0)))
+            view_elev = 90
+            view_azim = -90
+        else:
+            vertices_to_plot = vertices_eq
+            spin_axis = spin_axis_eq / np.linalg.norm(spin_axis_eq)
+            aspect_angle = np.degrees(np.arccos(np.clip(np.dot(spin_axis, np.asarray([0.0, 0.0, 1.0])), -1.0, 1.0)))
+            view_elev = 20
+            view_azim = 35
+
+        sun_vector_plot = None
+        if textureSun and not isNone(sun_vector_eq):
+            sun_vector_plot = sun_vector_eq / np.linalg.norm(sun_vector_eq)
+            if not isNone(occ):
+                sun_vector_plot = self._to_occultation_view_frame(np.asarray([sun_vector_plot]), occ)[0][0]
+            sun_vector_plot = sun_vector_plot / np.linalg.norm(sun_vector_plot)
+
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')
+
+        ax.set_facecolor('black')
+        fig.patch.set_facecolor('black')
+
+        tris = self.triangles
+        if textureSun and not isNone(sun_vector_plot):
+            normals, tri_vertices, tri_centers = self._compute_triangle_normals_outward(vertices_to_plot)
+            incidence = np.clip(np.dot(normals, sun_vector_plot), 0.0, 1.0)
+            visibility = self._compute_solar_visibility_factor(tri_vertices, tri_centers, sun_vector_plot, incidence)
+            illumination = incidence * visibility
+
+            sun_cmap = matplotlib.colors.LinearSegmentedColormap.from_list(
+                "sunlit_faces", ["red", "orange", "yellow"]
+            )
+
+            facecolors = np.zeros((len(tris), 4))
+            facecolors[:, :] = np.array([0.12, 0.12, 0.12, 0.85])
+            lit = illumination > 0
+            facecolors[lit] = sun_cmap(illumination[lit])
+            facecolors[lit, 3] = 0.95
+
+            mesh = ax.plot_trisurf(vertices_to_plot[:, 0], vertices_to_plot[:, 1], vertices_to_plot[:, 2],
+                                   triangles=tris, color='white', edgecolor='none', linewidth=0,
+                                   antialiased=False, shade=False)
+            mesh.set_facecolors(facecolors)
+        else:
+            num_triangles_to_exclude = min(10, len(tris))
+            tris_grey = tris[num_triangles_to_exclude:]
+            tris_blue = tris[:num_triangles_to_exclude]
+
+            ax.plot_trisurf(vertices_to_plot[:, 0], vertices_to_plot[:, 1], vertices_to_plot[:, 2],
+                            triangles=tris_grey, color='grey', edgecolor='none', alpha=0.7)
+
+            ax.plot_trisurf(vertices_to_plot[:, 0], vertices_to_plot[:, 1], vertices_to_plot[:, 2],
+                            triangles=tris_blue, color='blue', edgecolor='none', alpha=0.9)
+
+        max_range = np.array([
+            vertices_to_plot[:, 0].max() - vertices_to_plot[:, 0].min(),
+            vertices_to_plot[:, 1].max() - vertices_to_plot[:, 1].min(),
+            vertices_to_plot[:, 2].max() - vertices_to_plot[:, 2].min()
+        ]).max() / 2.0
+
+        mid_x = (vertices_to_plot[:, 0].max() + vertices_to_plot[:, 0].min()) * 0.5
+        mid_y = (vertices_to_plot[:, 1].max() + vertices_to_plot[:, 1].min()) * 0.5
+        mid_z = (vertices_to_plot[:, 2].max() + vertices_to_plot[:, 2].min()) * 0.5
+
+        spin_norm = np.linalg.norm(spin_axis)
+        if spin_norm == 0:
+            spin_axis = np.asarray([0.0, 0.0, 1.0])
+        else:
+            spin_axis = spin_axis / spin_norm
+
+        ax.quiver(mid_x, mid_y, mid_z,
+                  spin_axis[0] * max_range * 1.1,
+                  spin_axis[1] * max_range * 1.1,
+                  spin_axis[2] * max_range * 1.1,
+                  color='red', arrow_length_ratio=0.1, label='Spin axis')
+
+        fig.text(0.02, 0.02, f"Aspect angle: {aspect_angle:.2f} deg", color='white', fontsize=10)
+
+        x_lim = [mid_x - max_range, mid_x + max_range]
+        y_lim = [mid_y - max_range, mid_y + max_range]
+        z_lim = [mid_z - max_range, mid_z + max_range]
+        ax.set_xlim(x_lim)
+        ax.set_ylim(y_lim)
+        ax.set_zlim(z_lim)
+
+        ax.view_init(elev=view_elev, azim=view_azim)
+        ax.axis('off')
+        if title != "":
+            ax.set_title(title, color='white')
+        ax.legend(loc='upper right')
+        plt.show(block=block)
     
             
     def compute_volume_and_center_of_mass(self):
@@ -4036,6 +4280,9 @@ def argument():
                                                                                          to ensure that main axis are all positif and in the diagonal of the eigenvectors matrix""")
                                                         
     parser.add_argument("-ang", "--angle", type = float, default = None, help = "If use with -m: apply a rotation of the given angle (in degrees) along the spin axis before plotting. The rotation applies on transformed vertices if -pI is set.")
+    parser.add_argument("-pP", "--plotProjection", type = float, default = 100000000000000.0, help = "If use with -m and value is different from default, plot the 3D model projected at the given Julian date using parameters from ocFit_input.")
+    parser.add_argument("-t", "--textureSun", action = "store_true", help = "If use with -m -pP: color facets by solar illumination (red->orange->yellow for increasing sun incidence).")
+    parser.add_argument("-aId", "--asteroidId", type = str, default = None, help = "If use with -m -pP: asteroid identifier for Horizons query (smallbody id). Required for XML-independent sky-plane projection.")
     parser.add_argument("-backEnd", "--backEnd", type = str, default = "qt", help = "change graphic back end for matplotlib. if any error are trigger you can change this parameter options are agg, tkagg, qt. DEFAULT: qt")
     
     args = parser.parse_args()                                                                               
@@ -4046,6 +4293,9 @@ def argument():
 
 
 def modelTool(args):
+
+    if args.plotProjection != 100000000000000.0:
+        modelToolPlotProjection(args)
     
     shouldPlotMod = args.plotModel 
     shouldDrawShape = args.drawShape   
@@ -4076,6 +4326,205 @@ def modelTool(args):
     
     input("press touch to exit")
     
+    sys.exit()
+
+def _find_models_in_directory(directory):
+    return sorted(glob.glob(directory + "*.tri") + glob.glob(directory + "*.obj"))
+
+def _resolve_model_path_from_option(path_or_dir):
+    p = pathFormat(path_or_dir)
+    if os.path.isfile(p):
+        return p
+    if os.path.isdir(p):
+        candidates = _find_models_in_directory(p)
+        if len(candidates) > 0:
+            return candidates[0]
+    return None
+
+class _ProjectionFrame:
+    def __init__(self, sEps, sNu):
+        self.sEps = sEps
+        self.sNu = sNu
+
+def _query_asteroid_radec_horizons(asteroid_id, projection_date_jd):
+    try:
+        eph = Horizons(id=str(asteroid_id), id_type='smallbody', location='500', epochs=float(projection_date_jd)).ephemerides()
+    except Exception:
+        eph = Horizons(id=str(asteroid_id), id_type='smallbody', location='500@399', epochs=float(projection_date_jd)).ephemerides()
+
+    ra = np.deg2rad(float(eph['RA'][0]))
+    dec = np.deg2rad(float(eph['DEC'][0]))
+    return ra, dec
+
+def _build_projection_frame_from_horizons(asteroid_id, projection_date_jd):
+    ra, dec = _query_asteroid_radec_horizons(asteroid_id, projection_date_jd)
+
+    sEps = np.asarray([
+        -np.sin(dec) * np.cos(ra),
+        -np.sin(dec) * np.sin(ra),
+        np.cos(dec)
+    ])
+
+    sNu = np.asarray([
+        np.sin(ra),
+        -np.cos(ra),
+        0
+    ])
+
+    return _ProjectionFrame(sEps, sNu), np.rad2deg(ra), np.rad2deg(dec)
+
+def _query_sun_vector_from_horizons(asteroid_id, projection_date_jd):
+    vec = Horizons(
+        id=str(asteroid_id),
+        id_type='smallbody',
+        location='500@10',
+        epochs=float(projection_date_jd)
+    ).vectors(refplane='earth')
+
+    sun_to_ast = np.asarray([
+        float(vec['x'][0]),
+        float(vec['y'][0]),
+        float(vec['z'][0])
+    ])
+
+    ast_to_sun = -1.0 * sun_to_ast
+    norm = np.linalg.norm(ast_to_sun)
+    if norm == 0:
+        raise ValueError("invalid zero asteroid->sun vector from Horizons")
+
+    return ast_to_sun / norm
+
+def modelToolPlotProjection(args):
+    projection_date = float(args.plotProjection)
+
+    if isNone(args.asteroidId):
+        print("ERROR: -m -pP requires -aId/--asteroidId to query Horizons without XML files.")
+        sys.exit()
+
+    option_m1_provided = ("-mP" in sys.argv) or ("--modelPath" in sys.argv)
+    option_m2_provided = ("-m2P" in sys.argv) or ("--model2Path" in sys.argv)
+
+    search_dir = file_path
+    if option_m1_provided:
+        p = pathFormat(args.modelPath)
+        search_dir = p if os.path.isdir(p) else os.path.dirname(p) + "/"
+    elif option_m2_provided:
+        p = pathFormat(args.model2Path)
+        search_dir = p if os.path.isdir(p) else os.path.dirname(p) + "/"
+
+    input_path = search_dir + "ocFit_input"
+    if not os.path.isfile(input_path):
+        print("ERROR: ocFit_input was not found in", search_dir)
+        sys.exit()
+
+    ofi = OcFitInputParser(input_path)
+    try:
+        occ, ra_deg, dec_deg = _build_projection_frame_from_horizons(args.asteroidId, projection_date)
+        print("Horizons frame built for asteroid", args.asteroidId, "at JD", projection_date)
+        print("Geocentric RA/Dec (deg):", ra_deg, dec_deg)
+    except Exception as e:
+        print("ERROR: unable to query Horizons for asteroid", args.asteroidId, "->", e)
+        sys.exit()
+
+    sun_vector_eq = None
+    if args.textureSun:
+        try:
+            sun_vector_eq = _query_sun_vector_from_horizons(args.asteroidId, projection_date)
+            print("Solar illumination enabled (-t): asteroid->sun vector successfully queried from Horizons")
+        except Exception as e:
+            print("ERROR: unable to query sun direction for asteroid", args.asteroidId, "->", e)
+            sys.exit()
+
+    model1_path = None
+    model2_path = None
+
+    if option_m1_provided:
+        model1_path = _resolve_model_path_from_option(args.modelPath)
+    if option_m2_provided:
+        model2_path = _resolve_model_path_from_option(args.model2Path)
+
+    if not option_m1_provided and not option_m2_provided:
+        found_models = _find_models_in_directory(search_dir)
+        if len(found_models) == 0:
+            print("ERROR: no model .tri or .obj file found in", search_dir)
+            sys.exit()
+
+        print("Found model files:")
+        for m in found_models:
+            print(" -", m)
+
+        model1_path = found_models[0]
+        model2_path = found_models[1] if len(found_models) > 1 else None
+
+        print("Using model 1:", model1_path)
+        print("Using model 2:", model2_path)
+
+    if isNone(model1_path) and isNone(model2_path):
+        print("ERROR: no usable model path was found")
+        sys.exit()
+
+    if isNone(model1_path) and not isNone(model2_path):
+        model1_path = model2_path
+        model2_path = None
+
+    if not isNone(model1_path):
+        s1 = {
+            "lambda": ofi.getLamb(0),
+            "beta": ofi.getBeta(0),
+            "period": ofi.getPeriod(0),
+            "zero": ofi.getInitialTime(0),
+            "phase": ofi.getInitialPhase(0)
+        }
+
+        print("Using solution 1 with model:", model1_path)
+        m1 = ModelParser(model1_path, s1)
+        m1.plot_projected_from_earth(
+            projection_date,
+            s1["lambda"],
+            s1["beta"],
+            s1["period"],
+            s1["zero"],
+            s1["phase"],
+            transformed=args.projectAlongInertia,
+            block=False,
+            title="Projected model - solution 1",
+            occ=occ,
+            textureSun=args.textureSun,
+            sun_vector_eq=sun_vector_eq
+        )
+
+    if ofi.nSolution >= 2:
+        if isNone(model2_path):
+            print("ERROR: ocFit_input contains 2 solutions but no second model was found")
+            sys.exit()
+
+        s2 = {
+            "lambda": ofi.getLamb(1),
+            "beta": ofi.getBeta(1),
+            "period": ofi.getPeriod(1),
+            "zero": ofi.getInitialTime(1),
+            "phase": ofi.getInitialPhase(1)
+        }
+
+        print("Using solution 2 with model:", model2_path)
+        m2 = ModelParser(model2_path, s2)
+        m2.plot_projected_from_earth(
+            projection_date,
+            s2["lambda"],
+            s2["beta"],
+            s2["period"],
+            s2["zero"],
+            s2["phase"],
+            transformed=args.projectAlongInertia,
+            block=True,
+            title="Projected model - solution 2",
+            occ=occ,
+            textureSun=args.textureSun,
+            sun_vector_eq=sun_vector_eq
+        )
+    else:
+        plt.show(block=True)
+
     sys.exit()
 
 def isNone(val):
